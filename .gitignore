@@ -2,3 +2,5 @@
 __pycache__/
 *.ipynb_checkpoints
 *.png
+.matplotlib/
+_mpl-cache/

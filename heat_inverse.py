@@ -1,159 +1,263 @@
-import time
-import jax, jax.numpy as jnp
-from jax import jit, grad, lax
-import numpy as np
-import matplotlib.pyplot as plt
+import os
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.path.dirname(__file__), ".matplotlib"))
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
 
-def build_laplacian_1d(Nx):
-    n = Nx - 2
-    main = -2.0 * jnp.ones((n,))
-    off  =  1.0 * jnp.ones((n-1,))
-    return main, off
+import time
+from functools import partial
+
+import jax
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 def solve_tridiag(main, off, rhs):
-    n = rhs.shape[0]
-    def fwd(carry, i):
-        c_star, d_star = carry
-        denom = main[i] - (off[i-1]**2) * c_star[i-1]
-        c_star = c_star.at[i].set(off[i-1]/denom if i < n-1 else 0.0)
-        d_star = d_star.at[i].set((rhs[i]-off[i-1]*d_star[i-1])/denom)
-        return (c_star, d_star), None
-    c_star = jnp.zeros((n,)); d_star = jnp.zeros((n,))
-    denom0 = main[0]
-    c_star = c_star.at[0].set(off[0]/denom0 if n>1 else 0.0)
-    d_star = d_star.at[0].set(rhs[0]/denom0)
-    (c_star, d_star), _ = lax.scan(fwd, (c_star, d_star), jnp.arange(1, n))
-    def bwd(u_next, i): return d_star[i] - c_star[i]*u_next, None
-    u_last = d_star[-1]
-    u_rev, _ = lax.scan(bwd, u_last, jnp.arange(n-2, -1, -1))
-    u = jnp.concatenate([u_rev[1:], jnp.array([u_last])])
-    return u
+    """Thomas algorithm using JAX primitives for tri-diagonal systems."""
+    main = jnp.asarray(main)
+    rhs = jnp.asarray(rhs)
+    off = jnp.asarray(off)
+    n = main.shape[0]
 
-def make_stepper(Nx, dx, dt, kappa):
-    main_L, off_L = build_laplacian_1d(Nx)
-    alpha = -kappa*dt/(dx*dx)
-    main_A = 1.0 - alpha*main_L
-    off_A  = -alpha*off_L
-    @jit
+    if n == 1:
+        return rhs / main
+
+    off_pad = jnp.concatenate([off, jnp.zeros((1,), dtype=off.dtype)])
+
+    denom0 = main[0]
+    d0 = rhs[0] / denom0
+    c0 = off_pad[0] / denom0
+
+    def forward(carry, i):
+        c_prev, d_prev = carry
+        idx = i + 1
+        denom = main[idx] - off[idx - 1] * c_prev
+        d_curr = (rhs[idx] - off[idx - 1] * d_prev) / denom
+        c_curr = off_pad[idx] / denom
+        return (c_curr, d_curr), (c_curr, d_curr)
+
+    (_, _), (c_tail, d_tail) = jax.lax.scan(forward, (c0, d0), jnp.arange(n - 1))
+    c_seq = jnp.concatenate([jnp.array([c0]), c_tail])
+    d_seq = jnp.concatenate([jnp.array([d0]), d_tail])
+
+    x_last = d_seq[-1]
+
+    def backward(carry, inputs):
+        c_i, d_i = inputs
+        x_i = d_i - c_i * carry
+        return x_i, x_i
+
+    rev_inputs = (jnp.flip(c_seq[:-1]), jnp.flip(d_seq[:-1]))
+    _, rev_sol = jax.lax.scan(backward, x_last, rev_inputs)
+    sol = jnp.concatenate([jnp.flip(rev_sol), jnp.array([x_last])])
+    return sol
+
+
+def make_stepper(nx, dx, dt, kappa):
+    alpha = kappa * dt / (dx * dx)
+    n_inner = nx - 2
+    main = jnp.full((n_inner,), 1.0 + 2.0 * alpha)
+    off = jnp.full((n_inner - 1,), -alpha)
+
+    @jax.jit
     def step(u, s):
-        rhs = u + dt*s
-        return solve_tridiag(main_A, off_A, rhs)
+        rhs = u + dt * s
+        return solve_tridiag(main, off, rhs)
+
     return step
 
-def rollout(u0, s, step, Nt):
+
+def rollout(u0, s, step_fn, nt):
     def body(u, _):
-        u_next = step(u, s)
+        u_next = step_fn(u, s)
         return u_next, u_next
-    uT, traj = lax.scan(body, u0, None, length=Nt)
-    return uT, traj
 
-def synth_setup(Nx=129, Nt=200, T=0.1, kappa=1.0, key=0):
-    key = jax.random.PRNGKey(key)
-    dx = 1.0/(Nx-1); dt = T/Nt
-    xs = jnp.linspace(0,1,Nx)[1:-1]
-    s_true = jnp.sin(2*jnp.pi*xs)
-    u0 = jnp.zeros_like(s_true)
-    step = make_stepper(Nx, dx, dt, kappa)
-    uT, _ = rollout(u0, s_true, step, Nt)
-    noise = 0.01*jax.random.normal(key, uT.shape)
-    y_final = uT + noise
-    return xs, s_true, u0, y_final, step, (dx,dt,kappa,Nt,Nx)
+    final_u, traj = jax.lax.scan(body, u0, None, length=nt)
+    return final_u, traj
 
-def loss_finaltime(s, u0, y_final, step, Nt, lam=1e-2):
-    uT, _ = rollout(u0, s, step, Nt)
-    mis = 0.5*jnp.mean((uT - y_final)**2)
-    reg = 0.5*lam*jnp.mean(s**2)
-    return mis + reg
 
-loss_finaltime_grad = jit(grad(loss_finaltime))
+def loss_finaltime(s, u0, y_final, step_fn, nt, lam):
+    uT, _ = rollout(u0, s, step_fn, nt)
+    misfit = uT - y_final
+    data_term = 0.5 * jnp.sum(misfit ** 2)
+    reg = 0.5 * lam * jnp.sum(s ** 2)
+    return data_term + reg
 
-@jit
-def gd_step(s, g, lr=0.5): return s - lr*g
 
-def run_exp_A():
-    print("\n[Exp-A] Final-time full-field")
-    xs, s_true, u0, y_final, step, params = synth_setup()
-    _, _, _, Nt, _ = params
-    s = jnp.zeros_like(s_true)
-    _ = loss_finaltime(s, u0, y_final, step, Nt)   # JIT warmup
-    losses=[]; t0=time.perf_counter()
-    for it in range(200):
-        g = loss_finaltime_grad(s, u0, y_final, step, Nt)
-        s = gd_step(s, g, lr=0.5)
-        if it%5==0:
-            losses.append(float(loss_finaltime(s, u0, y_final, step, Nt)))
-    t1=time.perf_counter()
-    rel=float(jnp.linalg.norm(s-s_true)/jnp.linalg.norm(s_true))
-    print(f"rel_err(s)={rel:.3e} | time={(t1-t0):.2f}s | iters=200")
-    import numpy as np
-    plt.figure(); plt.semilogy(np.arange(len(losses))*5, losses)
-    plt.xlabel("iter"); plt.ylabel("loss"); plt.title("Exp-A loss"); plt.savefig("expA_loss.png", dpi=160)
-    plt.figure(); plt.plot(np.array(xs), np.array(s_true), label="s_true")
-    plt.plot(np.array(xs), np.array(s), '--', label="s_est"); plt.legend(); plt.title("Exp-A source")
-    plt.savefig("expA_source.png", dpi=160)
+def loss_sparsepoints(s, u0, idx, y_sparse, step_fn, nt, lam):
+    uT, _ = rollout(u0, s, step_fn, nt)
+    pred = uT[idx]
+    misfit = pred - y_sparse
+    data_term = 0.5 * jnp.sum(misfit ** 2)
+    reg = 0.5 * lam * jnp.sum(s ** 2)
+    return data_term + reg
 
-def run_exp_B():
-    print("\n[Exp-B] Sparse sensors")
-    xs, s_true, u0, y_final, step, params = synth_setup()
-    _, _, _, Nt, _ = params
-    s = jnp.zeros_like(s_true)
-    M=12; idx=np.linspace(0, s_true.shape[0]-1, M, dtype=int)
-    y_sparse=np.array(y_final)[idx]
-    def loss_sparsepoints(s, u0, idx, y, step, Nt, lam=5e-2):
-        uT,_=rollout(u0,s,step,Nt)
-        return 0.5*jnp.mean((uT[idx]-y)**2)+0.5*lam*jnp.mean(s**2)
-    grad_sparse = jit(grad(loss_sparsepoints))
-    _ = loss_sparsepoints(s, u0, idx, y_sparse, step, Nt)
-    losses=[]; t0=time.perf_counter()
-    for it in range(300):
-        g = grad_sparse(s, u0, idx, y_sparse, step, Nt)
-        s = gd_step(s, g, lr=0.3)
-        if it%10==0:
-            losses.append(float(loss_sparsepoints(s, u0, idx, y_sparse, step, Nt)))
-    t1=time.perf_counter()
-    rel=float(jnp.linalg.norm(s-s_true)/jnp.linalg.norm(s_true))
-    print(f"rel_err(s)={rel:.3e} | time={(t1-t0):.2f}s | iters=300")
-    plt.figure(); plt.semilogy(np.arange(len(losses))*10, losses)
-    plt.xlabel("iter"); plt.ylabel("loss"); plt.title("Exp-B loss"); plt.savefig("expB_loss.png", dpi=160)
-    plt.figure(); plt.plot(np.array(xs), np.array(s_true), label="s_true")
-    plt.plot(np.array(xs), np.array(s), '--', label="s_est")
-    plt.scatter(np.array(xs)[idx], y_sparse*0, s=18, marker='x', label='sensors'); plt.legend(); plt.title("Exp-B source")
-    plt.savefig("expB_source.png", dpi=160)
 
-def run_exp_C():
-    print("\n[Exp-C] Multi-time")
-    xs, s_true, u0, y_final, step, params = synth_setup()
-    _, _, _, Nt, _ = params
-    s = jnp.zeros_like(s_true)
-    t_indices = np.array([int(Nt*0.3), int(Nt*0.6), Nt-1], dtype=int)
-    _, traj = rollout(u0, s_true, step, Nt)
-    y_list = [np.array(traj[i]) + 0.01*np.random.randn(traj[i].shape[0]) for i in t_indices]
-    def loss_multitime(s, u0, y_list, step, t_indices, lam=1e-2):
-        uT,traj=rollout(u0,s,step,t_indices[-1]+1)
-        mis=0.0
-        for idx,y in zip(t_indices,y_list): mis = mis + 0.5*jnp.mean((traj[idx]-y)**2)
-        return mis + 0.5*lam*jnp.mean(s**2)
-    grad_multi = jit(grad(loss_multitime))
-    _ = loss_multitime(s, u0, y_list, step, t_indices)
-    losses=[]; t0=time.perf_counter()
-    for it in range(200):
-        g = grad_multi(s, u0, y_list, step, t_indices)
-        s = gd_step(s, g, lr=0.4)
-        if it%5==0:
-            losses.append(float(loss_multitime(s, u0, y_list, step, t_indices)))
-    t1=time.perf_counter()
-    rel=float(jnp.linalg.norm(s-s_true)/jnp.linalg.norm(s_true))
-    print(f"rel_err(s)={rel:.3e} | time={(t1-t0):.2f}s | iters=200")
-    plt.figure(); plt.semilogy(np.arange(len(losses))*5, losses)
-    plt.xlabel("iter"); plt.ylabel("loss"); plt.title("Exp-C loss"); plt.savefig("expC_loss.png", dpi=160)
-    plt.figure(); plt.plot(np.array(xs), np.array(s_true), label="s_true")
-    plt.plot(np.array(xs), np.array(s), '--', label="s_est"); plt.legend(); plt.title("Exp-C source")
-    plt.savefig("expC_source.png", dpi=160)
+def loss_multitime(s, u0, y_all, step_fn, nt, t_indices, lam):
+    _, traj = rollout(u0, s, step_fn, nt)
+    snapshots = jnp.take(traj, t_indices - 1, axis=0)
+    misfit = snapshots - y_all
+    data_term = 0.5 * jnp.sum(misfit ** 2)
+    reg = 0.5 * lam * jnp.sum(s ** 2)
+    return data_term + reg
+
+
+def generate_true_source(nx):
+    x = jnp.linspace(0.0, 1.0, nx)
+    interior = x[1:-1]
+    return jnp.sin(2.0 * jnp.pi * interior)
+
+
+def generate_observations(step_fn, u0, s_true, nt, noise_std, key):
+    uT, traj = rollout(u0, s_true, step_fn, nt)
+    noise_key, key = jax.random.split(key)
+    noise_final = noise_std * jax.random.normal(noise_key, uT.shape)
+    y_final = uT + noise_final
+
+    sensor_idx = np.linspace(0, uT.shape[0] - 1, num=16, dtype=int)
+    noise_key, key = jax.random.split(key)
+    noise_sparse = noise_std * jax.random.normal(noise_key, (sensor_idx.size,))
+    y_sparse = uT[sensor_idx] + noise_sparse
+
+    t_indices = jnp.array([int(0.3 * nt), int(0.6 * nt), nt])
+    t_indices = jnp.clip(t_indices, 1, nt)
+    noise_key, _ = jax.random.split(key)
+    noise_multi = noise_std * jax.random.normal(noise_key, (t_indices.shape[0], uT.shape[0]))
+    snapshots = jnp.take(traj, t_indices - 1, axis=0) + noise_multi
+
+    return {
+        "y_final": y_final,
+        "sensor_idx": jnp.array(sensor_idx),
+        "y_sparse": y_sparse,
+        "t_indices": t_indices,
+        "y_multi": snapshots,
+    }
+
+
+def run_adam(loss_fn, grad_fn, s_init, steps, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+    s = s_init
+    m = jnp.zeros_like(s)
+    v = jnp.zeros_like(s)
+    loss_history = []
+    beta1_power = 1.0
+    beta2_power = 1.0
+    for _ in range(1, steps + 1):
+        loss_val = loss_fn(s)
+        grad_val = grad_fn(s)
+        m = (1.0 - beta1) * grad_val + beta1 * m
+        v = (1.0 - beta2) * (grad_val ** 2) + beta2 * v
+        beta1_power *= beta1
+        beta2_power *= beta2
+        m_hat = m / (1.0 - beta1_power)
+        v_hat = v / (1.0 - beta2_power)
+        s = s - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+        loss_history.append(float(loss_val))
+    final_loss = float(loss_fn(s))
+    return s, np.array(loss_history), final_loss
+
+
+def plot_loss(path, losses):
+    plt.figure()
+    plt.semilogy(np.arange(1, losses.size + 1), losses)
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def plot_sources(path, x_interior, s_true, s_est, sensors=None):
+    x_vals = np.asarray(x_interior)
+    s_true_np = np.asarray(s_true)
+    s_est_np = np.asarray(s_est)
+    plt.figure()
+    plt.plot(x_vals, s_true_np, label="true", linewidth=2)
+    plt.plot(x_vals, s_est_np, label="estimated", linestyle="--", linewidth=2)
+    if sensors is not None:
+        sensor_pos = x_vals[np.asarray(sensors)]
+        plt.scatter(sensor_pos, s_true_np[np.asarray(sensors)], marker="x", color="black", label="sensors")
+    plt.xlabel("x")
+    plt.ylabel("s(x)")
+    plt.legend()
+    plt.grid(True, alpha=0.4)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
 
 def main():
-    print("JAX no-NN baseline: 1D heat source inversion")
-    run_exp_A(); run_exp_B(); run_exp_C()
-    print("Saved plots: expA_loss.png, expA_source.png, expB_loss.png, expB_source.png, expC_loss.png, expC_source.png")
+    nx = 129
+    nt = 200
+    T = 0.1
+    kappa = 1.0
+    dt = T / nt
+    dx = 1.0 / (nx - 1)
+
+    u0 = jnp.zeros((nx - 2,))
+    s_true = generate_true_source(nx)
+
+    step_fn = make_stepper(nx, dx, dt, kappa)
+
+    key = jax.random.PRNGKey(0)
+    obs = generate_observations(step_fn, u0, s_true, nt, noise_std=0.001, key=key)
+
+    x = jnp.linspace(0.0, 1.0, nx)[1:-1]
+
+    experiments = [
+        {
+            "name": "expA",
+            "loss": partial(loss_finaltime, u0=u0, y_final=obs["y_final"], step_fn=step_fn, nt=nt, lam=1e-4),
+            "lr": 1.5,
+            "steps": 3000,
+        },
+        {
+            "name": "expB",
+            "loss": partial(
+                loss_sparsepoints,
+                u0=u0,
+                idx=obs["sensor_idx"],
+                y_sparse=obs["y_sparse"],
+                step_fn=step_fn,
+                nt=nt,
+                lam=1e-5,
+            ),
+            "lr": 0.4,
+            "steps": 4500,
+        },
+        {
+            "name": "expC",
+            "loss": partial(
+                loss_multitime,
+                u0=u0,
+                y_all=obs["y_multi"],
+                step_fn=step_fn,
+                nt=nt,
+                t_indices=obs["t_indices"],
+                lam=1e-4,
+            ),
+            "lr": 1.2,
+            "steps": 3000,
+        },
+    ]
+
+    for exp in experiments:
+        loss_fn = jax.jit(exp["loss"])
+        grad_fn = jax.jit(jax.grad(exp["loss"]))
+        s0 = jnp.zeros_like(s_true)
+        start = time.time()
+        s_est, losses, _ = run_adam(loss_fn, grad_fn, s0, exp["steps"], exp["lr"])
+        duration = time.time() - start
+
+        rel_error = float(jnp.linalg.norm(s_est - s_true) / jnp.linalg.norm(s_true))
+        print(f"{exp['name']}: relative error={rel_error:.4f}, duration={duration:.2f}s")
+
+        plot_loss(f"{exp['name']}_loss.png", losses)
+        sensors = None
+        if exp["name"] == "expB":
+            sensors = obs["sensor_idx"]
+        plot_sources(f"{exp['name']}_source.png", x, s_true, s_est, sensors=sensors)
+
 
 if __name__ == "__main__":
     main()
